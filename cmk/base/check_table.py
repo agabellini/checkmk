@@ -18,7 +18,7 @@ import cmk.base.check_utils
 import cmk.base.check_api_utils as check_api_utils
 from cmk.utils.type_defs import HostName
 from cmk.base.check_utils import (
-    LegacyCheckParameters,
+    CheckParameters,
     CheckPluginName,
     CheckTable,
     DiscoveredCheckTable,
@@ -249,13 +249,13 @@ def get_precompiled_check_table(hostname,
 
 
 def get_precompiled_check_parameters(hostname, item, params, check_plugin_name):
-    # type: (HostName, Item, LegacyCheckParameters, CheckPluginName) -> LegacyCheckParameters
+    # type: (HostName, Item, CheckParameters, CheckPluginName) -> CheckParameters
     precomp_func = config.precompile_params.get(check_plugin_name)
     if precomp_func:
         if not callable(precomp_func):
             raise TypeError("Invalid precompile_params function: %r" % precomp_func)
-        precomp_func = cast(
-            Callable[[HostName, Item, LegacyCheckParameters], LegacyCheckParameters], precomp_func)
+        precomp_func = cast(Callable[[HostName, Item, CheckParameters], CheckParameters],
+                            precomp_func)
         return precomp_func(hostname, item, params)
     return params
 

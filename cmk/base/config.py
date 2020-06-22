@@ -86,7 +86,7 @@ import cmk.base.check_utils
 import cmk.base.default_config as default_config
 from cmk.base.caching import config_cache as _config_cache
 from cmk.base.caching import runtime_cache as _runtime_cache
-from cmk.base.check_utils import LegacyCheckParameters, DiscoveredService, SectionName
+from cmk.base.check_utils import CheckParameters, DiscoveredService, SectionName
 from cmk.base.default_config import *  # pylint: disable=wildcard-import,unused-wildcard-import
 
 try:
@@ -103,7 +103,6 @@ try:
     )
     from cmk.base.api.agent_based.register.check_plugins_legacy import (
         create_check_plugin_from_legacy,
-        maincheckify,
         resolve_legacy_name,
     )
 except ImportError:
@@ -2154,34 +2153,23 @@ def discoverable_snmp_checks():
 
 
 def compute_check_parameters(host, checktype, item, params):
-    # type: (HostName, Union[CheckPluginName, PluginName], Item, LegacyCheckParameters) -> Optional[LegacyCheckParameters]
+    # type: (HostName, CheckPluginName, Item, CheckParameters) -> Optional[CheckParameters]
     """Compute parameters for a check honoring factory settings,
     default settings of user in main.mk, check_parameters[] and
     the values code in autochecks (given as parameter params)"""
-    # TODO (mo): The signature of this function has been broadened to accept CheckPluginName
-    # *or* PluginName alternatively (to ease migration).
-    # Once we're ready, it should only accept the PluginName (or even the plugin itself, we will
-    # see)
-    if isinstance(checktype, PluginName):
-        plugin_name = checktype
-    else:
-        plugin_name = PluginName(maincheckify(checktype))
-
-    plugin = get_registered_check_plugin(plugin_name)
-    if plugin is None:  # handle vanished check plugin
+    if checktype not in check_info:  # handle vanished checktype
         return None
 
-    params = _update_with_default_check_parameters(plugin, params)
-    params = _update_with_configured_check_parameters(host, plugin, item, params)
+    params = _update_with_default_check_parameters(checktype, params)
+    params = _update_with_configured_check_parameters(host, checktype, item, params)
 
     return params
 
 
-def _update_with_default_check_parameters(plugin, params):
-    # type: (CheckPlugin, LegacyCheckParameters) -> LegacyCheckParameters
+def _update_with_default_check_parameters(checktype, params):
+    # type: (CheckPluginName, CheckParameters) -> CheckParameters
     # Handle dictionary based checks
-    if plugin.check_default_parameters is None:
-        return params
+    def_levels_varname = check_info[checktype].get("default_levels_variable")
 
     # Handle case where parameter is None but the type of the
     # default value is a dictionary. This is for example the
@@ -2191,27 +2179,45 @@ def _update_with_default_check_parameters(plugin, params):
     # None as a parameter. We convert that to an empty dictionary
     # that will be updated with the factory settings and default
     # levels, if possible.
-    if params is None:
-        params = {}
+    if params is None and def_levels_varname:
+        fs = factory_settings.get(def_levels_varname)
+        if isinstance(fs, dict):
+            params = {}
 
-    # Merge params from inventory onto default parameters (if params is not updateable, it wins):
-    return {**plugin.check_default_parameters, **params} if isinstance(params, dict) else params
+    # Honor factory settings for dict-type checks. Merge
+    # dict type checks with multiple matching rules
+    if isinstance(params, dict):
+
+        # Start with factory settings
+        if def_levels_varname:
+            new_params = factory_settings.get(def_levels_varname, {}).copy()
+        else:
+            new_params = {}
+
+        # Merge user's default settings onto it
+        check_context = _check_contexts[checktype]
+        if def_levels_varname and def_levels_varname in check_context:
+            def_levels = check_context[def_levels_varname]
+            if isinstance(def_levels, dict):
+                new_params.update(def_levels)
+
+        # Merge params from inventory onto it
+        new_params.update(params)
+        params = new_params
+
+    return params
 
 
-def _update_with_configured_check_parameters(host, plugin, item, params):
-    # type: (HostName, CheckPlugin, Item, LegacyCheckParameters) -> LegacyCheckParameters
-    descr = service_description(host, plugin.name, item)
+def _update_with_configured_check_parameters(host, checktype, item, params):
+    # type: (HostName, CheckPluginName, Item, CheckParameters) -> CheckParameters
+    descr = service_description(host, checktype, item)
 
     config_cache = get_config_cache()
 
     # Get parameters configured via checkgroup_parameters
-    entries = _get_checkgroup_parameters(
-        config_cache,
-        host,
-        str(plugin.check_ruleset_name),
-        item,
-        descr,
-    ) if plugin.check_ruleset_name is not None else []
+    checkgroup = check_info[checktype]["group"]
+    entries = ([] if not checkgroup else _get_checkgroup_parameters(config_cache, host, checkgroup,
+                                                                    item, descr))
 
     # Get parameters configured via check_parameters
     entries += config_cache.service_extra_conf(host, descr, check_parameters)
@@ -2253,7 +2259,7 @@ def set_timespecific_param_list(entries, params):
 
 
 def _get_checkgroup_parameters(config_cache, host, checkgroup, item, descr):
-    # type: (ConfigCache, HostName, RulesetName, Item, ServiceName) -> List[LegacyCheckParameters]
+    # type: (ConfigCache, HostName, RulesetName, Item, ServiceName) -> List[CheckParameters]
     rules = checkgroup_parameters.get(checkgroup)
     if rules is None:
         return []
@@ -3019,7 +3025,7 @@ class HostConfig:
 
     @property
     def static_checks(self):
-        # type: () -> List[Tuple[RulesetName, CheckPluginName, Item, LegacyCheckParameters]]
+        # type: () -> List[Tuple[RulesetName, CheckPluginName, Item, CheckParameters]]
         """Returns a table of all "manual checks" configured for this host"""
         matched = []
         for checkgroup_name in static_checks:
@@ -3542,7 +3548,7 @@ class ConfigCache:
         return attrs
 
     def icons_and_actions_of_service(self, hostname, description, checkname, params):
-        # type: (HostName, ServiceName, Optional[CheckPluginName], LegacyCheckParameters) -> List[str]
+        # type: (HostName, ServiceName, Optional[CheckPluginName], CheckParameters) -> List[str]
         actions = set(self.service_extra_conf(hostname, description, service_icons_and_actions))
 
         # Some WATO rules might register icons on their own
@@ -3583,12 +3589,10 @@ class ConfigCache:
 
     def service_level_of_service(self, hostname, description):
         # type: (HostName, ServiceName) -> Optional[int]
-        return self.get_service_ruleset_value(
-            hostname,
-            description,
-            service_service_levels,
-            deflt=None,
-        )
+        return self.get_service_ruleset_value(hostname,
+                                              description,
+                                              service_service_levels,
+                                              deflt=None)
 
     def check_period_of_service(self, hostname, description):
         # type: (HostName, ServiceName) -> Optional[TimeperiodName]
@@ -3622,11 +3626,10 @@ class ConfigCache:
         if cache_id in self._cache_match_object_service:
             return self._cache_match_object_service[cache_id]
 
-        result = RulesetMatchObject(
-            host_name=hostname,
-            service_description=svc_desc,
-            service_labels=self.labels.labels_of_service(self.ruleset_matcher, hostname, svc_desc),
-        )
+        result = RulesetMatchObject(host_name=hostname,
+                                    service_description=svc_desc,
+                                    service_labels=self.labels.labels_of_service(
+                                        self.ruleset_matcher, hostname, svc_desc))
         self._cache_match_object_service[cache_id] = result
         return result
 
@@ -3644,11 +3647,10 @@ class ConfigCache:
         if cache_id in self._cache_match_object_service_checkgroup:
             return self._cache_match_object_service_checkgroup[cache_id]
 
-        result = RulesetMatchObject(
-            host_name=hostname,
-            service_description=item,
-            service_labels=self.labels.labels_of_service(self.ruleset_matcher, hostname, svc_desc),
-        )
+        result = RulesetMatchObject(host_name=hostname,
+                                    service_description=item,
+                                    service_labels=self.labels.labels_of_service(
+                                        self.ruleset_matcher, hostname, svc_desc))
         self._cache_match_object_service_checkgroup[cache_id] = result
         return result
 
@@ -3671,12 +3673,8 @@ class ConfigCache:
 
     def get_autochecks_of(self, hostname):
         # type: (HostName) -> List[cmk.base.check_utils.Service]
-        return self._autochecks_manager.get_autochecks_of(
-            hostname,
-            compute_check_parameters,
-            service_description,
-            get_check_variables,
-        )
+        return self._autochecks_manager.get_autochecks_of(hostname, compute_check_parameters,
+                                                          service_description, get_check_variables)
 
     def section_name_of(self, section):
         # type: (CheckPluginName) -> SectionName
@@ -3700,18 +3698,13 @@ class ConfigCache:
     def host_extra_conf_merged(self, hostname, ruleset):
         # type: (HostName, Ruleset) -> Dict[str, Any]
         return self.ruleset_matcher.get_host_ruleset_merged_dict(
-            self.ruleset_match_object_of_host(hostname),
-            ruleset,
-        )
+            self.ruleset_match_object_of_host(hostname), ruleset)
 
     def host_extra_conf(self, hostname, ruleset):
         # type: (HostName, Ruleset) -> List
         return list(
             self.ruleset_matcher.get_host_ruleset_values(
-                self.ruleset_match_object_of_host(hostname),
-                ruleset,
-                is_binary=False,
-            ))
+                self.ruleset_match_object_of_host(hostname), ruleset, is_binary=False))
 
     # TODO: Cleanup external in_binary_hostlist call sites
     def in_binary_hostlist(self, hostname, ruleset):
@@ -3723,21 +3716,19 @@ class ConfigCache:
         # type: (HostName, ServiceName, Ruleset) -> List
         """Compute outcome of a service rule set that has an item."""
         return list(
-            self.ruleset_matcher.get_service_ruleset_values(
-                self.ruleset_match_object_of_service(hostname, description),
-                ruleset,
-                is_binary=False,
-            ))
+            self.ruleset_matcher.get_service_ruleset_values(self.ruleset_match_object_of_service(
+                hostname, description),
+                                                            ruleset,
+                                                            is_binary=False))
 
     def get_service_ruleset_value(self, hostname, description, ruleset, deflt):
         # type: (HostName, ServiceName, Ruleset, Any) -> Any
         """Compute first match service ruleset outcome with fallback to a default value"""
         return next(
-            self.ruleset_matcher.get_service_ruleset_values(
-                self.ruleset_match_object_of_service(hostname, description),
-                ruleset,
-                is_binary=False,
-            ), deflt)
+            self.ruleset_matcher.get_service_ruleset_values(self.ruleset_match_object_of_service(
+                hostname, description),
+                                                            ruleset,
+                                                            is_binary=False), deflt)
 
     def service_extra_conf_merged(self, hostname, description, ruleset):
         # type: (HostName, ServiceName, Ruleset) -> Dict[str, Any]
@@ -3794,11 +3785,8 @@ class ConfigCache:
         # type: () -> Set[HostName]
         """Returns a set of all hosts, regardless if currently disabled or monitored on a remote site."""
         hosts = set()  # type: Set[HostName]
-        hosts.update(
-            self.all_configured_realhosts(),
-            self.all_configured_clusters(),
-            self._get_all_configured_shadow_hosts(),
-        )
+        hosts.update(self.all_configured_realhosts(), self.all_configured_clusters(),
+                     self._get_all_configured_shadow_hosts())
         return hosts
 
     def _setup_clusters_nodes_cache(self):
